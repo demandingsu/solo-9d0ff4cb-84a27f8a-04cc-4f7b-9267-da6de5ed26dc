@@ -1,7 +1,8 @@
 """生成离线示例公告站（纯静态 HTML）。
 
-场景覆盖（查询时刻 2026-11-11T10:00+08:00）：
-  001 12 路原始停运，查询时有效
+主站场景覆盖（查询时刻 2026-11-11T10:00+08:00）：
+  001 12 路原始停运，查询时有效；014 撤销公告详情返回 503（列表标明引用 001）
+      -> 001 所在链列为待核实，不再报为有效
   002 18 路已过停运结束时间（过期）
   003 25 路原始停运，006 更正、010 再更正（更正引用更正，区间被两次替换）
   004 33 路停运，007 撤销（整条链失效）
@@ -9,7 +10,12 @@
   008 5 路停运区间尚未开始
   009 40 路停运，011 更正同时引用了不存在的 N-2026-999（无法匹配的引用）
   013 50 路整条公告发布于查询时刻之后（时间门控）
+  015 70 路停运公告详情缺“发布时间”，解析失败（列表可知为独立停运）
   另有一个跨站详情链接，验证同站限制。
+
+uncertain/ 子站（查询时刻同上）：
+  020 撤销公告详情返回 503，列表未标明引用 -> 整次查询无法核定
+  021 80 路停运，本来有效，但因为整次查询无法核定，不给出确定结论
 """
 from __future__ import annotations
 
@@ -34,6 +40,9 @@ class Notice:
     suspend_end: str | None = None
     references: list[str] = field(default_factory=list)
     offsite: bool = False  # 列表项指向外站
+    fail_mode: str | None = None  # http_503：详情由示例站服务器返回 503
+    list_refs: list[str] = field(default_factory=list)  # 列表页标明的引用编号
+    omit_fields: set[str] = field(default_factory=set)  # 生成详情时省略的字段
 
 
 NOTICES: list[Notice] = [
@@ -78,6 +87,23 @@ NOTICES: list[Notice] = [
            "2026-11-18T20:00:00+08:00"),
     Notice("N-EXT-001", "suspension", "外站转载公告（跨站链接示例）", "99 路",
            "2026-11-08T09:00:00+08:00", offsite=True),
+    # 详情页返回 503：列表标明它撤销了 001，故 001 所在链应列为待核实
+    Notice("N-2026-014", "cancellation", "12 路停运撤销公告（详情暂不可用）", "12 路",
+           "2026-11-09T12:00:00+08:00", references=["N-2026-001"],
+           fail_mode="http_503", list_refs=["N-2026-001"]),
+    # 详情页缺发布时间：列表已知是 70 路独立停运，其自身内容待核实
+    Notice("N-2026-015", "suspension", "70 路临时停运公告（页面字段不全）", "70 路",
+           "2026-11-09T11:00:00+08:00", "2026-11-11T06:00:00+08:00",
+           "2026-11-14T20:00:00+08:00", omit_fields={"published_at"}),
+]
+
+# 第二个站点：撤销公告详情 503 且列表未标明引用 -> 整次查询无法核定
+UNCERTAIN_NOTICES: list[Notice] = [
+    Notice("N-2026-021", "suspension", "80 路临时停运公告", "80 路",
+           "2026-11-08T09:00:00+08:00", "2026-11-10T06:00:00+08:00",
+           "2026-11-13T22:00:00+08:00"),
+    Notice("N-2026-020", "cancellation", "停运撤销公告（详情暂不可用）", None,
+           "2026-11-09T12:00:00+08:00", fail_mode="http_503"),
 ]
 
 KIND_CN = {"suspension": "停运", "correction": "更正", "cancellation": "撤销"}
@@ -91,11 +117,16 @@ def detail_path(n: Notice) -> str:
     return f"notices/{n.notice_id}.html"
 
 
+def _marker_path(n: Notice) -> str:
+    """需返回 503 的详情，写入占位标记文件而非 HTML（生成器脚本名以 _ 开头）。"""
+    return f"notices/_{n.notice_id}.unavailable"
+
+
 def render_detail(n: Notice) -> str:
     rows: list[str] = []
 
     def row(field_name: str, label: str, value: str | None, is_time: bool = False) -> None:
-        if value is None:
+        if value is None or field_name in n.omit_fields:
             return
         if is_time:
             cell = f'<time datetime="{_esc(value)}">{_esc(value.replace("T", " "))}</time>'
@@ -144,9 +175,12 @@ def render_list(page_notices: list[Notice], page_idx: int, total_pages: int) -> 
             href = "http://external.example.org/notice/N-EXT-001.html"
         else:
             href = detail_path(n)
+        ref_attr = ""
+        if n.list_refs:
+            ref_attr = f' data-ref-ids="{_esc(",".join(n.list_refs))}"'
         items.append(
             f'    <article class="notice" data-id="{_esc(n.notice_id)}" '
-            f'data-kind="{n.kind}">\n'
+            f'data-kind="{n.kind}"{ref_attr}>\n'
             f'      <a class="detail-link" href="{_esc(href)}">{_esc(n.title)}</a>\n'
             f'      <span class="published">{_esc(n.published_at)}</span>\n'
             f"    </article>"
@@ -180,6 +214,10 @@ def build() -> None:
 
     real_notices = [n for n in NOTICES if not n.offsite]
     for n in real_notices:
+        if n.fail_mode == "http_503":
+            # 页面实体不存在；服务器脚本看到占位标记后返回 503
+            (OUT_DIR / _marker_path(n)).write_text("503\n", encoding="utf-8")
+            continue
         (OUT_DIR / detail_path(n)).write_text(render_detail(n), encoding="utf-8")
 
     pages: list[list[Notice]] = [
@@ -192,7 +230,31 @@ def build() -> None:
             render_list(page_notices, idx, total), encoding="utf-8"
         )
 
-    print(f"示例站点已生成: {OUT_DIR}（{len(real_notices)} 条公告，{total} 个列表页）")
+    # 第二个站点：列表未标明失败撤销公告引用的是什么，整次查询将无法核定
+    u_dir = OUT_DIR / "uncertain"
+    (u_dir / "notices").mkdir(parents=True)
+    for n in UNCERTAIN_NOTICES:
+        if n.fail_mode == "http_503":
+            (u_dir / _marker_path(n)).write_text("503\n", encoding="utf-8")
+            continue
+        (u_dir / detail_path(n)).write_text(render_detail(n), encoding="utf-8")
+    (u_dir / "index.html").write_text(
+        render_list(UNCERTAIN_NOTICES, 0, 1), encoding="utf-8"
+    )
+
+    # 主站根列表显式链到 uncertain 子站，便于离线演示“无法核定”
+    index_path = OUT_DIR / "index.html"
+    index_html = index_path.read_text(encoding="utf-8")
+    index_html = index_html.replace(
+        "</body>",
+        '  <p><a href="uncertain/index.html">另一公告站（含无法核定的撤销公告）</a></p>\n</body>',
+    )
+    index_path.write_text(index_html, encoding="utf-8")
+
+    print(
+        f"示例站点已生成: {OUT_DIR}（主站 {len(real_notices)} 条公告，{total} 个列表页；"
+        f"uncertain 子站 {len(UNCERTAIN_NOTICES)} 条公告）"
+    )
 
 
 if __name__ == "__main__":

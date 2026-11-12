@@ -6,6 +6,9 @@
   <nav class="pager"> 中存放“下一页”链接 <a rel="next" href="...">；
   每条公告为 <article class="notice" data-id="编号" data-kind="suspension|correction|cancellation">，
   内含 <a class="detail-link" href="详情相对/绝对 URL">标题</a>。
+  列表若已标明该公告引用了哪些编号，可用 ``data-ref-ids="编号1,编号2"``
+  或 <a class="reference" data-ref-id="编号"> 表示；详情抓取失败时，
+  这些信息用于定位失败的更正/撤销会影响哪条链。
 
 详情页
   <table class="notice-fields"> 内 <tr data-field="..."> 定义字段，
@@ -19,6 +22,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
@@ -55,6 +59,21 @@ def is_same_site(url: str, base_url: str) -> bool:
     return (a.scheme, a.hostname, a.port) == (b.scheme, b.hostname, b.port)
 
 
+def _parse_kind(raw: str | None, title: str | None = None) -> NoticeKind | None:
+    """把详情/列表中的类型文本映射为枚举，无法识别返回 None。"""
+    kind = KIND_MAP.get((raw or "").strip())
+    if kind is not None:
+        return kind
+    text = f"{raw or ''} {title or ''}"
+    if "撤销" in text:
+        return NoticeKind.CANCELLATION
+    if "更正" in text:
+        return NoticeKind.CORRECTION
+    if "停运" in text:
+        return NoticeKind.SUSPENSION
+    return None
+
+
 def parse_next_page(html: str, page_url: str) -> str | None:
     """从列表页提取 rel=next 的分页链接（同站绝对 URL），没有则 None。"""
     soup = BeautifulSoup(html, "html.parser")
@@ -64,19 +83,58 @@ def parse_next_page(html: str, page_url: str) -> str | None:
     return _abs_url(page_url, nxt["href"])
 
 
-def parse_detail_links(html: str, page_url: str) -> list[tuple[str, str | None, str | None]]:
-    """列表页 -> (详情绝对 URL, 编号, 类型) 列表，保持页面顺序。"""
+@dataclass
+class DetailLink:
+    """列表页上的一条公告摘要。详情失败时仍可用这些信息定位受影响公告链。"""
+
+    url: str
+    notice_id: str | None = None
+    kind: NoticeKind | None = None
+    kind_raw: str | None = None
+    title: str | None = None
+    references: list[str] = field(default_factory=list)
+
+
+def _link_references(art) -> list[str]:
+    """列表项中标明的引用编号。
+
+    约定：``<a class="reference" data-ref-id="编号">``，
+    或列表项用 ``data-ref-ids="编号1,编号2"`` 一次性列出。
+    只认显式标记，避免把详情链接自身误当作引用。
+    """
+    refs: list[str] = []
+    for a in art.select("a.reference[data-ref-id]"):
+        rid = a.get("data-ref-id", "").strip()
+        if rid:
+            refs.append(rid)
+    for raw in (art.get("data-ref-ids"), art.get("data-refs")):
+        if not raw:
+            continue
+        for part in raw.replace("、", ",").split(","):
+            rid = part.strip()
+            if rid and rid not in refs:
+                refs.append(rid)
+    return refs
+
+
+def parse_detail_links(html: str, page_url: str) -> list[DetailLink]:
+    """列表页 -> 详情链接摘要列表，保持页面顺序。"""
     soup = BeautifulSoup(html, "html.parser")
-    out: list[tuple[str, str | None, str | None]] = []
+    out: list[DetailLink] = []
     for art in soup.select("article.notice"):
         link = art.select_one("a.detail-link[href]") or art.select_one("a[href]")
         if link is None:
             continue
+        kind_raw = art.get("data-kind")
+        title = link.get_text(strip=True) or None
         out.append(
-            (
-                _abs_url(page_url, link["href"]),
-                art.get("data-id"),
-                art.get("data-kind"),
+            DetailLink(
+                url=_abs_url(page_url, link["href"]),
+                notice_id=(art.get("data-id") or "").strip() or None,
+                kind=_parse_kind(kind_raw, title),
+                kind_raw=kind_raw,
+                title=title,
+                references=_link_references(art),
             )
         )
     return out
@@ -123,16 +181,9 @@ def parse_detail(html: str, detail_url: str) -> Announcement:
         raise ValueError(f"详情页缺少公告编号: {detail_url}")
 
     kind_raw = pick("kind", *FIELD_KEYS["kind"]) or ""
-    kind = KIND_MAP.get(kind_raw.strip())
+    kind = _parse_kind(kind_raw, title)
     if kind is None:
-        # 回退：从编号/标题推断
-        text = f"{kind_raw} {title or ''}"
-        if "撤销" in text:
-            kind = NoticeKind.CANCELLATION
-        elif "更正" in text:
-            kind = NoticeKind.CORRECTION
-        else:
-            kind = NoticeKind.SUSPENSION
+        raise ValueError(f"详情页无法识别公告类型: {detail_url}")
 
     published_raw = pick("published_at", *FIELD_KEYS["published_at"])
     if not published_raw:

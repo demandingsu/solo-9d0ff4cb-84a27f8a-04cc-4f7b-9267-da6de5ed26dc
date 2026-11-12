@@ -8,8 +8,14 @@ import httpx
 from fastapi import FastAPI, HTTPException
 
 from .crawler import Crawler
-from .engine import reconstruct
-from .models import QueryRequest, QueryResponse
+from .engine import FailedNotice, reconstruct
+from .models import (
+    FailedDetail,
+    FailureStage,
+    PendingVerificationChain,
+    QueryRequest,
+    QueryResponse,
+)
 
 logger = logging.getLogger("bus_notice_api")
 
@@ -45,11 +51,6 @@ async def query(req: QueryRequest) -> QueryResponse:
     crawler = Crawler(app.state.http_client)
     crawl = await crawler.crawl(req.index_url)
 
-    result = reconstruct(crawl.announcements, req.query_time)
-
-    if crawl.errors:
-        logger.warning("抓取过程出现 %d 个错误: %s", len(crawl.errors), crawl.errors[:3])
-
     if not crawl.list_pages:
         raise HTTPException(
             status_code=502,
@@ -59,14 +60,64 @@ async def query(req: QueryRequest) -> QueryResponse:
             },
         )
 
+    failed_details = [
+        FailedDetail(
+            notice_id=f.link.notice_id,
+            kind=f.link.kind,
+            kind_raw=f.link.kind_raw,
+            url=f.link.url,
+            stage=FailureStage(f.stage),
+            reason=f.reason,
+            references=f.link.references,
+            title=f.link.title,
+        )
+        for f in crawl.failures
+    ]
+
+    result = reconstruct(
+        crawl.announcements,
+        req.query_time,
+        failures=[
+            FailedNotice(
+                notice_id=f.link.notice_id,
+                kind=f.link.kind,
+                references=f.link.references,
+                url=f.link.url,
+                reason=f.reason,
+                stage=f.stage,
+                title=f.link.title,
+            )
+            for f in crawl.failures
+        ],
+    )
+
+    if crawl.errors:
+        logger.warning("抓取过程出现 %d 个错误: %s", len(crawl.errors), crawl.errors[:3])
+
     return QueryResponse(
         index_url=req.index_url,
         query_time=req.query_time,
         list_pages_crawled=crawl.list_pages,
         detail_pages_crawled=crawl.detail_pages,
         announcements_parsed=len(crawl.announcements),
+        determination=result.determination,
+        determination_reason=result.determination_reason,
         active_suspensions=result.active,
         inactive_chains=result.inactive,
+        pending_verification_chains=[
+            PendingVerificationChain(
+                root_id=p.root_id,
+                route=p.route,
+                reason=p.reason,
+                chain=p.chain,
+                sources=p.sources,
+                failed_notice_ids=p.failed_notice_ids,
+                failed_urls=p.failed_urls,
+                latest_published_at=p.latest_published_at,
+            )
+            for p in result.pending
+        ],
+        failed_details=failed_details,
         unmatched_references=result.unmatched,
         skipped_offsite_links=crawl.skipped_offsite,
     )

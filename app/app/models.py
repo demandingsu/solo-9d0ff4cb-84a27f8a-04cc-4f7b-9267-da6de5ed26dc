@@ -92,6 +92,59 @@ class UnmatchedReference(BaseModel):
     kind: NoticeKind
 
 
+class FailureStage(str, Enum):
+    """失败发生的阶段。"""
+
+    FETCH = "fetch"      # 详情页 HTTP 抓取失败（如 503）
+    PARSE = "parse"      # 详情页已取回但字段解析失败
+
+
+class FailedDetail(BaseModel):
+    """抓取或解析失败的详情。
+
+    即使详情不可用，只要列表页给出了信息，也要保留列表声明的编号、类型与地址，
+    供调度员核对并定位受影响公告链。
+    """
+
+    notice_id: str | None = Field(None, description="列表页声明的公告编号（缺失则为 null）")
+    kind: NoticeKind | None = Field(None, description="列表页声明的公告类型（可识别时）")
+    kind_raw: str | None = Field(None, description="列表页原始类型值（无法识别时保留原文）")
+    url: str = Field(..., description="失败的详情页地址")
+    stage: FailureStage
+    reason: str = Field(..., description="失败原因，如 HTTP 503 / 详情页缺少发布时间")
+    references: list[str] = Field(
+        default_factory=list, description="列表页标明的引用编号，用于定位受影响公告链"
+    )
+    title: str | None = None
+
+
+class PendingVerificationChain(BaseModel):
+    """因详情失败而无法核实的公告链。
+
+    这些链不参与有效停运结论，需调度员人工核实失败公告后再判定。
+    """
+
+    root_id: str
+    route: str | None
+    reason: str = Field(
+        ...,
+        description="pending_verification（已定位到具体链）/ indeterminate（整次查询无法核定）",
+    )
+    chain: list[str]
+    sources: list[str]
+    failed_notice_ids: list[str] = Field(default_factory=list)
+    failed_urls: list[str] = Field(default_factory=list)
+    latest_published_at: datetime | None = None
+
+
+class Determination(str, Enum):
+    """整次查询的可核定程度。"""
+
+    DETERMINED = "determined"        # 所有详情均成功，结论完整
+    PARTIAL = "partial"              # 失败公告已定位到具体链，其余独立链照常判定
+    INDETERMINATE = "indeterminate"  # 无法确认失败公告影响哪条链，整次查询无法核定
+
+
 class QueryResponse(BaseModel):
     """查询结果。"""
 
@@ -100,7 +153,19 @@ class QueryResponse(BaseModel):
     list_pages_crawled: list[str]
     detail_pages_crawled: int
     announcements_parsed: int
+    determination: Determination = Field(
+        ..., description="determined / partial / indeterminate"
+    )
+    determination_reason: str | None = Field(
+        None, description="无法核定或仅部分可核定时的人类可读原因"
+    )
     active_suspensions: list[ActiveSuspension]
     inactive_chains: list[InactiveChain]
+    pending_verification_chains: list[PendingVerificationChain] = Field(
+        default_factory=list, description="详情失败导致待核实的公告链"
+    )
+    failed_details: list[FailedDetail] = Field(
+        default_factory=list, description="抓取/解析失败的详情，保留列表编号、类型与地址"
+    )
     unmatched_references: list[UnmatchedReference]
     skipped_offsite_links: list[str] = Field(default_factory=list)

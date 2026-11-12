@@ -7,6 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$ROOT/.venv/bin/python"
 QUERY_TIME="${1:-2026-11-11T10:00:00+08:00}"
 SITE_URL="http://127.0.0.1:8080/index.html"
+UNCERTAIN_URL="http://127.0.0.1:8080/uncertain/index.html"
 
 if [[ ! -x "$PY" ]]; then
   echo "缺少虚拟环境，请先创建: python3 -m venv --without-pip .venv && 引导 pip 后 pip install -r app/requirements.txt" >&2
@@ -22,8 +23,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 2) 启动示例公告站（8080）
-( cd "$ROOT/site/html" && "$PY" -I -m http.server 8080 --bind 127.0.0.1 ) &
+# 2) 启动示例公告站（8080；serve_site.py 会对标记的详情返回 503）
+( cd "$ROOT/site/html" && "$PY" -I "$ROOT/site/serve_site.py" --bind 127.0.0.1 --port 8080 --directory . ) &
 SITE_PID=$!
 
 # 3) 启动采集 API（8000）
@@ -39,3 +40,9 @@ echo "== 查询时刻: $QUERY_TIME =="
 curl -s -X POST http://127.0.0.1:8000/query \
   -H 'Content-Type: application/json' \
   -d "{\"index_url\":\"$SITE_URL\",\"query_time\":\"$QUERY_TIME\"}" | "$PY" -I -m json.tool
+
+echo
+echo "== 无法核定示例（撤销公告详情 503，列表未标明引用）: $UNCERTAIN_URL =="
+curl -s -X POST http://127.0.0.1:8000/query \
+  -H 'Content-Type: application/json' \
+  -d "{\"index_url\":\"$UNCERTAIN_URL\",\"query_time\":\"$QUERY_TIME\"}" | "$PY" -I -m json.tool

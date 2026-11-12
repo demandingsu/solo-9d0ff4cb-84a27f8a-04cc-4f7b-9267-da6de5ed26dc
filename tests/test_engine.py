@@ -5,7 +5,7 @@ from datetime import datetime
 
 import pytest
 
-from app.engine import reconstruct
+from app.engine import FailedNotice, reconstruct
 from app.models import Announcement, NoticeKind
 
 TZ = "+08:00"
@@ -189,3 +189,187 @@ def test_naive_datetime_rejected_by_model():
             published_at=parse_dt("2026-11-11T10:00:00"),  # 无时区
             references=[], url="http://x", title=None,
         )
+
+
+# --- 详情失败：不能把可能已撤销的停运误报为有效 ---
+
+
+def failed(
+    notice_id: str | None,
+    kind: NoticeKind | None,
+    refs: list[str] | None = None,
+    *,
+    stage: str = "fetch",
+    reason: str = "HTTP 503",
+) -> FailedNotice:
+    return FailedNotice(
+        notice_id=notice_id,
+        kind=kind,
+        references=refs or [],
+        url=f"http://x/notices/{notice_id or 'unknown'}.html",
+        reason=reason,
+        stage=stage,
+    )
+
+
+def _active_ann(
+    notice_id: str, kind: NoticeKind = NoticeKind.SUSPENSION, route: str = "12 路"
+) -> Announcement:
+    return make(
+        notice_id,
+        kind,
+        f"2026-11-08T09:00:00{TZ}",
+        route=route,
+        start=f"2026-11-10T06:00:00{TZ}",
+        end=f"2026-11-12T22:00:00{TZ}",
+    )
+
+
+def test_failed_cancellation_with_reference_marks_chain_pending():
+    anns = [_active_ann("A1")]
+    res = reconstruct(
+        anns, Q, [failed("A2", NoticeKind.CANCELLATION, ["A1"])]
+    )
+    # 撤销详情不可用：不能再把 A1 报为有效
+    assert res.active == []
+    assert res.inactive == []
+    assert len(res.pending) == 1
+    p = res.pending[0]
+    assert p.root_id == "A1"
+    assert p.chain == ["A1"]
+    assert p.failed_notice_ids == ["A2"]
+    assert p.reason == "pending_verification"
+    assert res.determination == "partial"
+
+
+def test_failed_correction_chain_pending_but_other_independent_chain_judged():
+    # A1 -> B1 的链被失败更正指向；C1 是另一条独立停运，照常判断
+    anns = [
+        _active_ann("A1"),
+        _active_ann("C1", route="18 路"),
+    ]
+    res = reconstruct(
+        anns, Q, [failed("B1", NoticeKind.CORRECTION, ["A1"])]
+    )
+    assert {tuple(a.source_chain) for a in res.active} == {("C1",)}
+    assert len(res.pending) == 1
+    assert res.pending[0].root_id == "A1"
+    assert res.determination == "partial"
+
+
+def test_failed_detail_without_reference_makes_query_indeterminate():
+    anns = [_active_ann("A1"), _active_ann("C1", route="18 路")]
+    res = reconstruct(
+        anns, Q, [failed("B1", NoticeKind.CANCELLATION)]
+    )
+    # 无法确认影响哪条链：整次查询无法核定，不给出任何有效停运结论
+    assert res.active == []
+    assert res.determination == "indeterminate"
+    assert res.determination_reason
+    assert any(p.reason == "indeterminate" for p in res.pending)
+    # 已有确定原因的链仍然可以解释
+    assert res.inactive == []
+
+
+def test_failed_detail_missing_id_is_indeterminate():
+    res = reconstruct([_active_ann("A1")], Q, [failed(None, None)])
+    assert res.active == []
+    assert res.determination == "indeterminate"
+
+
+def test_parse_failure_follows_same_rules():
+    # 详情解析失败的撤销公告同样会使相关链待核实，并保留失败地址与原因
+    res = reconstruct(
+        [_active_ann("A1")],
+        Q,
+        [failed("A2", NoticeKind.CANCELLATION, ["A1"], stage="parse",
+                reason="详情页缺少发布时间: http://x/notices/A2.html")],
+    )
+    assert res.active == []
+    assert res.pending[0].failed_urls == ["http://x/notices/A2.html"]
+    assert res.pending[0].root_id == "A1"
+
+
+def test_failed_independent_suspension_is_pending_without_blocking_others():
+    anns = [_active_ann("A1")]
+    res = reconstruct(anns, Q, [failed("B1", NoticeKind.SUSPENSION)])
+    # 列表已标明是独立停运：只影响自身，A1 照常有效
+    assert [a.source_chain for a in res.active] == [["A1"]]
+    assert [p.root_id for p in res.pending] == ["B1"]
+    assert res.determination == "partial"
+
+
+def test_failed_reference_chain_through_another_failure_is_indeterminate():
+    # B1 的详情失败，B2 引用 B1；B1 的列表又没给引用，无法定位链
+    anns = [_active_ann("A1")]
+    res = reconstruct(
+        anns,
+        Q,
+        [failed("B2", NoticeKind.CORRECTION, ["B1"]), failed("B1", NoticeKind.CANCELLATION)],
+    )
+    assert res.determination == "indeterminate"
+    assert res.active == []
+
+
+def test_failed_reference_to_nonexistent_id_is_own_unknown_chain():
+    # 失败更正引用了整站不存在的编号：按既有规则它自成一链，内容未知 -> 待核实
+    anns = [_active_ann("A1")]
+    res = reconstruct(
+        anns, Q, [failed("B1", NoticeKind.CORRECTION, ["GHOST"])]
+    )
+    assert [a.source_chain for a in res.active] == [["A1"]]
+    assert [p.root_id for p in res.pending] == ["B1"]
+    assert res.determination == "partial"
+
+
+def test_successful_duplicate_of_failed_id_is_not_pending():
+    # 同编号已有成功解析的公告时，失败页不再影响结论
+    anns = [
+        _active_ann("A1"),
+        make("B1", NoticeKind.CANCELLATION, f"2026-11-09T12:00:00{TZ}",
+             route="12 路", refs=["A1"]),
+    ]
+    res = reconstruct(anns, Q, [failed("B1", NoticeKind.CANCELLATION, ["A1"])])
+    assert res.determination == "determined"
+    assert res.pending == []
+    assert res.active == []
+    assert res.inactive[0].reason == "cancelled"
+
+
+def test_failure_inside_visible_chain_blocks_that_branch_only():
+    # A1 有两个分支：A2 与 C1；失败更正指向 A2 所在分支
+    anns = [
+        _active_ann("A1"),
+        make("A2", NoticeKind.CORRECTION, f"2026-11-09T09:00:00{TZ}",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-20T22:00:00{TZ}",
+             refs=["A1"]),
+        _active_ann("C1", route="18 路"),
+    ]
+    res = reconstruct(
+        anns, Q, [failed("B1", NoticeKind.CANCELLATION, ["A2"])]
+    )
+    # 受影响分支待核实（A1->A2），C1 照常有效
+    assert [a.source_chain for a in res.active] == [["C1"]]
+    assert [p.chain for p in res.pending] == [["A1", "A2"]]
+
+
+def test_pending_branch_shadows_sibling_branch_of_same_root():
+    # A1 有 A2、A3 两个更正分支；失败公告指向 A2。
+    # 不能仅凭 A3 分支给出有效结论：它同样可能被失败公告影响。
+    anns = [
+        _active_ann("A1"),
+        make("A2", NoticeKind.CORRECTION, f"2026-11-09T09:00:00{TZ}",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-20T22:00:00{TZ}",
+             refs=["A1"]),
+        make("A3", NoticeKind.CORRECTION, f"2026-11-09T10:00:00{TZ}",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-21T22:00:00{TZ}",
+             refs=["A1"]),
+        _active_ann("X1", route="18 路"),
+    ]
+    res = reconstruct(
+        anns, Q, [failed("B1", NoticeKind.CORRECTION, ["A2"])]
+    )
+    # 根 A1 下的所有分支都不给结论；无关的 X1 照常有效
+    assert [a.source_chain for a in res.active] == [["X1"]]
+    assert [p.chain for p in res.pending] == [["A1", "A2"]]
+    assert res.determination == "partial"
